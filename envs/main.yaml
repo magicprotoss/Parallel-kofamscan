@@ -1,0 +1,12 @@
+name: main
+channels:
+  - main
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - pandas
+  - numpy
+  - plotnine
+  - jupyter
+  - nbconvert
