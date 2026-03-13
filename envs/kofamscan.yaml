@@ -1,0 +1,8 @@
+name: kofamscan
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - kofamscan=1.3.0
+  - seqkit=2.13.0
