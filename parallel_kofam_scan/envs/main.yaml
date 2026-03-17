@@ -1,0 +1,16 @@
+name: parallel_kofam_scan
+channels:
+  - main
+  - bioconda
+  - conda-forge
+dependencies:
+  - python
+  - pandas>=3.0.0
+  - numpy
+  - plotnine
+  - jupyter
+  - nbconvert
+  - pyarrow
+  - tqdm
+  - snakemake>=9.16.0
+  - openpyxl

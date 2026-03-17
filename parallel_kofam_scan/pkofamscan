@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+
+from subprocess import run
+import yaml
+import collections.abc
+import os
+import sys
+import glob
+import shutil
+import argparse
+import pandas as pd
+import hashlib
+import datetime
+import tqdm
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog='Parallel-kofamscan',
+        description="A snakemake workflow to split unigenes into chucks in order to reduce kofamscan's runtime"
+    )
+
+    parser.add_argument('-i', '--input_path', required=True, nargs='+',
+                        help="Unigenes to annotate, filenames will be converted to sample-ids, gzipped files are supported as well")
+    parser.add_argument('-o', '--output_path', required=True,
+                        help="Directory to save the annotation results, the output would be stored in an sub-dir called KEGG_annotations")
+    parser.add_argument('-db', '--path_to_KEGG_database', required=True,
+                        help="Path to the kofamscan database, which contains a 'ko_list' file and a 'profiles' directory")
+    parser.add_argument('-d', '--working_dir', default='system_temp', type=str,
+                        help="Directory to store intermediate results, default is /tmp/parallel_kofamscan/<your_uid>/<hash_of_output_dir>_<hash_of_current_datetime>, \
+                            if set, the temp dir would be <working_dir>/parallel_kofamscan/<your_uid>/<hash_of_output_dir>_<hash_of_current_datetime>")
+    parser.add_argument('-p', '--workers', default=0, type=int,
+                        help="Number of cores to use for when running the workflow, \
+                            default is 0, which indicates the workflow will use the num of cores on the machine - 1, \
+                                or the num of chuncks * 16, whichever is smaller")
+    parser.add_argument('-t', '--threads_per_worker', default=8, type=int,
+                        help="Number of theards to use when running the exec_annotation cmd, default is 8")
+    parser.add_argument('-c', '--chunk_size', default=100000, type=int,
+                        help="Number of unigenes per chunk, default is 100000")
+    parser.add_argument('-f', '--force', default=False, type=bool,
+                        help="whether to overwrite existing result, default is no")
+    parser.add_argument('-e', '--min_e_value', default=0.001, type=float,
+                        help="Minimum E-value threshold to retain a KO hit during top-hit filtering, default is 0.001")
+    parser.add_argument('-s', '--min_score', default=100, type=int,
+                        help="Minimum hmmsearch score threshold to retain a KO hit during top-hit filtering, default is 100")
+
+    return parser.parse_args()
+
+
+def args_to_opts(args):
+    opts = {}
+
+    # a list containing the abs fps for each input fna/faa
+    # catch file not found error here, prompt the user to check if the input exist
+    opts['input_path'] = []
+    for x in args.input_path:
+        if not os.path.exists(x):
+            sys.exit(
+                f"Error: File not found {x}, please check whether the input exists")
+        opts['input_path'].append(os.path.abspath(x))
+    num_of_inputs = len(opts['input_path'])
+    if num_of_inputs > 0:
+        print(f"A total of {num_of_inputs} sample(s) found, proceeding...")
+    else:
+        sys.exit("Error, no inputs found")
+
+    # a string containing the abs fp to the output dir
+    # check if os.path.abspath(args.output_path) exists, if not prompt the user the output dir does not exist, ask them to create it first
+    # if os.path.abspath(args.output_path) exists, check whether the sub-folder 'KEGG_annotations' exists, if so:
+    # if args.force is ture, remove the 'KEGG_annotations' dir
+    # if args.force is false, raise an error telling the user there's results of a previous run
+    output_base = os.path.abspath(args.output_path)
+    if not os.path.exists(output_base):
+        sys.exit(
+            f"Error: Output directory {output_base} does not exist, please create it first")
+
+    kegg_out = os.path.join(output_base, 'KEGG_annotations')
+    if os.path.exists(kegg_out):
+        if args.force:
+            shutil.rmtree(kegg_out)
+        else:
+            sys.exit(
+                f"Error: There are results of a previous run in {kegg_out}, please use -f to overwrite or choose another output directory")
+
+    opts['output_path'] = kegg_out
+
+    print(f"Output will be saved to {kegg_out}")
+
+    os.makedirs(opts['output_path'], exist_ok=False)
+
+    # a string containing the abs fp to the KEGG database, in which contains a 'ko_list' file and a 'profiles' dir
+    # 1. check if the dir exist, if not raise an error and tell the user to input the correct fp
+    # 2. the 'ko_list' file is a tsv file with the following fields ("knum    threshold       score_type      profile_type    F-measure       nseq    nseq_used       alen    mlen    eff_nseq        re/pos     definition")
+    # read it into a dataframe and validate the header, then get the uniques of the col knum into a python list
+    # 3. validate that there's a {knum}.hmm in the 'profiles' dir for each {knum} in that list
+    # if any of the criteria in 2-3 fails, raise an error and tell the user to verify the KEGG database download
+    kegg_db = os.path.abspath(args.path_to_KEGG_database)
+    if not os.path.isdir(kegg_db):
+        sys.exit(
+            f"Error: KEGG database directory {kegg_db} not found, please check the path")
+
+    ko_list_path = os.path.join(kegg_db, 'ko_list')
+    profiles_dir = os.path.join(kegg_db, 'profiles')
+
+    if not os.path.isfile(ko_list_path):
+        sys.exit(
+            f"Error: 'ko_list' file not found in {kegg_db}, please check the database content")
+
+    if not os.path.isdir(profiles_dir):
+        sys.exit(
+            f"Error: 'profiles' directory not found in {kegg_db}, please check the database content")
+
+    try:
+        # Load ko_list, assuming tab-separated and header is present
+        # Skip the first line if it starts with 'knum' but isn't the true header? usually ko_list starts with the header directly.
+        # But sometimes it has metadata. However, usually 'knum' is the first column name.
+        df = pd.read_csv(ko_list_path, sep='\t')
+
+        expected_cols = ["knum", "threshold", "score_type", "profile_type", "F-measure",
+                         "nseq", "nseq_used", "alen", "mlen", "eff_nseq", "re/pos", "definition"]
+
+        # Check if all expected columns are present
+        if not all(col in df.columns for col in expected_cols):
+            sys.exit(
+                f"Error: 'ko_list' file in {kegg_db} does not have the expected header format. "
+                f"Expected columns: {expected_cols}")
+
+        unique_knums = df['knum'].unique().tolist()
+
+        print(
+            f"Found {len(unique_knums)} unique KOs in 'ko_list', validating the existance of corresponding HMM profiles...")
+
+        # Validate existence of .hmm files
+        # here, it's ok if some hmm profiles are missing, check if every hmm profile ends with "//", if not raise an error indicating corrupt download
+        # add tqdm bar here
+        # It's faster to list the dir once than check existence for each file thousands of times
+        existing_profiles = set(os.listdir(profiles_dir))
+
+        for filename in tqdm.tqdm(existing_profiles):
+            if not filename.endswith('.hmm'):
+                continue
+            hmm_fp = os.path.join(profiles_dir, filename)
+            try:
+                # check if file ends with //
+                # might have newline at end (//\n) or just //
+                # Reading last few bytes
+                with open(hmm_fp, 'rb') as f:
+                    try:
+                        f.seek(-5, os.SEEK_END)  # Read last 5 bytes to be safe
+                        tail = f.read().decode('utf-8', errors='ignore')
+                        if "//" not in tail:
+                            sys.exit(
+                                f"Error: Corrupt HMM profile {hmm_fp}. Does not end with '//'. Please verify the KEGG database download.")
+                    except OSError:
+                        # File too small?
+                        pass
+            except Exception as e:
+                sys.exit(f"Error checking HMM profile {hmm_fp}: {e}")
+
+        missing_profiles = []
+        for knum in unique_knums:
+            hmm_file = f"{knum}.hmm"
+            if hmm_file not in existing_profiles:
+                missing_profiles.append(hmm_file)
+
+        if missing_profiles:
+            # Show the first few missing files to avoid flooding the terminal
+            missing_sample = missing_profiles[:5]
+            print(
+                f"Warning: Missing profile HMM files in {profiles_dir} for some K-numbers found in ko_list. "
+                f"Missing examples: {missing_sample}. Total missing: {len(missing_profiles)}. "
+                "Please verify the KEGG database download.")
+
+    except Exception as e:
+        sys.exit(f"Error validating KEGG database: {str(e)}")
+
+    opts['ko_list'] = ko_list_path
+    opts['profiles'] = profiles_dir
+
+    # now build the fp to the temp dir which stores intermediate results and create the dir
+    # here, also check if $TMPDIR is set, if so, working_base = $TMPDIR
+    if args.working_dir == 'system_temp':
+        if 'TMPDIR' in os.environ:
+            working_base = os.path.abspath(os.environ['TMPDIR'])
+        else:
+            working_base = '/tmp'
+    else:
+        working_base = os.path.abspath(args.working_dir)
+
+    uid = os.getuid()
+    output_hash = hashlib.md5(opts['output_path'].encode()).hexdigest()
+    current_time_hash = hashlib.md5(
+        str(datetime.datetime.now()).encode()).hexdigest()
+
+    opts['working_dir'] = os.path.join(
+        working_base, 'parallel_kofamscan', str(uid), f"{output_hash}_{current_time_hash}")
+
+    os.makedirs(opts['working_dir'], exist_ok=True)
+
+    # an int of num of workers to use
+    n_cores = os.cpu_count()
+    if n_cores is None and args.workers > 0:
+        # We'll just have to trust the user on this one if we can't detect it ourselves
+        n_cores = args.workers
+    elif n_cores is None:
+        n_cores = 1  # Fallback if cpu_count cannot be determined
+
+    if args.workers == 0:
+        opts['workers'] = max(1, n_cores - 1)
+    elif args.workers >= n_cores:
+        opts['workers'] = n_cores
+    else:
+        opts['workers'] = args.workers
+
+    # get num of threads per cmd
+    opts['threads'] = args.threads_per_worker
+
+    # an int of num of unigenes per chunk
+    opts['chunk_size'] = args.chunk_size
+
+    opts['min_e_value'] = args.min_e_value
+    opts['min_score'] = args.min_score
+
+    return opts
+
+
+def main():
+    # get options
+    args = parse_args()
+    opts = args_to_opts(args)
+
+    # for testing only
+    print(opts)
+
+    # Define paths
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    snakefile = os.path.join(script_dir, "workflow", "exec_annotation.smk")
+    config_file = os.path.join(opts['output_path'], "snakemake_config.yaml")
+
+    # for testing only
+    print(config_file)
+    # Write config to file
+    with open(config_file, 'w') as f:
+        yaml.dump(opts, f)
+
+    # construct snakemake command
+    cmd = [
+        "snakemake",
+        "--snakefile", snakefile,
+        "--configfile", config_file,
+        "--cores", str(opts['workers']),
+        "--rerun-incomplete",
+        "--printshellcmds",
+        "--directory", opts['output_path']
+    ]
+
+    print(f"Running snakemake workflow...")
+    # Run snakemake
+    try:
+        run(cmd, check=True)
+    except Exception as e:
+        sys.exit(f"Error running snakemake: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
