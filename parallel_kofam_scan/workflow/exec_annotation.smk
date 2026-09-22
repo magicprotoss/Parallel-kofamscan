@@ -77,7 +77,8 @@ def get_annotation_targets(wildcards):
 rule all:
     input:
         os.path.join(output_dir, "final_results", "top-hits.xlsx"),
-        os.path.join(output_dir, "final_results", "annotations.parquet")
+        os.path.join(output_dir, "final_results", "hmm-hits.parquet"),
+        os.path.join(output_dir, "final_results", "sequence-metadata-map.parquet")
 
 #######################
 ### Validate inputs ###
@@ -94,7 +95,7 @@ rule validate_input:
         lambda wildcards: SAMPLES[wildcards.sample]
     output:
         os.path.join(working_dir, "validate_input", "{sample}", "header_map.parquet"),
-        os.path.join(working_dir, "validate_input", "{sample}", "unigene_uuid.faa"),
+        os.path.join(working_dir, "validate_input", "{sample}", "unigene_hash.faa"),
         os.path.join(working_dir, "validate_input", "{sample}", "done")
     log:
         os.path.join(log_dir, "validate_input", "{sample}.log")
@@ -103,7 +104,7 @@ rule validate_input:
         out_dir = lambda wildcards: os.path.join(working_dir, "validate_input", wildcards.sample)
     threads: 1
     shell:
-        "python3 {params.script} -i {input} -o {params.out_dir} > {log} 2>&1"
+        "python3 {params.script:q} -i {input:q} -o {params.out_dir:q} > {log:q} 2>&1"
 
 ##########################################################
 ### Concat unigenes, shuffle them and split to chuncks ###
@@ -123,7 +124,7 @@ checkpoint concat_shuffle_split:
         chunk_size = config['chunk_size']
     threads: config['workers']
     shell:
-        "python3 {params.script} -i {params.validate_input_dir} -o {params.out_dir} -c {params.chunk_size} -t {threads} > {log} 2>&1"
+        "python3 {params.script:q} -i {params.validate_input_dir:q} -o {params.out_dir:q} -c {params.chunk_size} -t {threads} > {log:q} 2>&1"
 
 ###########################
 ### Run exec_annotation ###
@@ -142,7 +143,7 @@ rule exec_annotation:
         tmp_dir = lambda wildcards: os.path.join(working_dir, "exec_annotation", wildcards.part_id, "tmp"),
     threads: config['threads']
     shell:
-        "conda run -n parallel-kofamscan.dependency.kofamscan exec_annotation -o {output.annotations} {input} -k {params.ko_list} -p {params.profiles} --cpu {threads} -f detail-tsv --tmp-dir {params.tmp_dir} > {log} 2>&1"
+        "conda run -n parallel-kofamscan.dependency.kofamscan exec_annotation -o {output.annotations:q} {input:q} -k {params.ko_list:q} -p {params.profiles:q} --cpu {threads} -f detail-tsv --tmp-dir {params.tmp_dir:q} > {log:q} 2>&1"
 
 ###########################################
 ### Collect results and perform top-hit ###
@@ -154,18 +155,21 @@ rule collect_results_run_top_hit:
         header_maps = expand(os.path.join(working_dir, "validate_input", "{sample}", "header_map.parquet"), sample=SAMPLES.keys())
     output:
         os.path.join(output_dir, "final_results", "top-hits.xlsx"),
-        os.path.join(output_dir, "final_results", "annotations.parquet")
+        os.path.join(output_dir, "final_results", "hmm-hits.parquet"),
+        os.path.join(output_dir, "final_results", "sequence-metadata-map.parquet")
     log:
         os.path.join(log_dir, "collect_results.log")
+    benchmark:
+        os.path.join(log_dir, "collect_results.benchmark.tsv")
     params:
         script = scripts_dir + "/collect_results.py",
         working_dir = working_dir,
         output_dir = os.path.join(output_dir, "final_results"),
         min_e_value = float(config['min_e_value']),
         min_score = int(config['min_score'])
-    threads: config['workers']
+    threads: 1
     shell:
-        "python3 {params.script} -wd {params.working_dir} -o {params.output_dir} -t {threads} > {log} 2>&1"
+        "python3 {params.script:q} -wd {params.working_dir:q} -o {params.output_dir:q} -t {threads} -e {params.min_e_value} -s {params.min_score} > {log:q} 2>&1"
 
 onsuccess:
     import shutil

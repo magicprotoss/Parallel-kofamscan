@@ -1,120 +1,106 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import shutil
 import argparse
-import pandas as pd
 import hashlib
-import datetime
-from subprocess import run
+import os
+from pathlib import Path
+from subprocess import DEVNULL, run
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+
+BATCH_SIZE = 8192
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        prog='Parallel-kofamscan',
-        description="A sub-script for validating the input unigenes and format it"
+        prog="Parallel-kofamscan",
+        description="Validate inputs and label protein sequences by content hash",
     )
-
-    parser.add_argument('-i', '--unigenes_fp', required=True,
-                        help="Path to unigenes to annotate, filenames will be converted to sample-ids")
-    parser.add_argument('-o', '--output_path', required=True,
-                        help="Directory to save the faa and header map parquet file, path is parsed from snakemake rule")
-
+    parser.add_argument("-i", "--unigenes_fp", required=True)
+    parser.add_argument("-o", "--output_path", required=True)
     return parser.parse_args()
 
 
 def validate_input_and_convert_fna_to_faa(unigenes_fp, output_path):
-    # translate validate and translate fna into faa
-    unigene_faa_fp = os.path.join(output_path, 'unigene.faa')
-    check_fna = run(
-        f"conda run -n parallel-kofamscan.dependency.kofamscan seqkit seq {unigenes_fp} -v -t dna", shell=True, capture_output=True, text=True)
-    if check_fna.returncode == 0:
-        # if the input is in fna format, convert it to faa format using seqkit
-        print(
-            f"Input unigenes {unigenes_fp} is in fna format, converting it to faa format using seqkit...")
-        fna_to_faa = run(
-            f"conda run -n parallel-kofamscan.dependency.kofamscan seqkit translate -T 11 {unigenes_fp} -o {unigene_faa_fp}", shell=True)
-        if fna_to_faa.returncode != 0:
-            sys.exit(
-                f"Error: Failed to convert {unigenes_fp} from fna to faa format")
-
-    elif check_fna.returncode != 0:
-        check_faa = run(
-            f"conda run -n parallel-kofamscan.dependency.kofamscan seqkit seq {unigenes_fp} -v -t protein", shell=True, capture_output=True, text=True)
-        if check_faa.returncode == 0:
-            print(
-                f"Input unigenes {unigenes_fp} is in faa format, proceeding...")
-            shutil.copy(unigenes_fp, unigene_faa_fp)
-        else:
-            sys.exit(
-                f"Error: Input unigenes {unigenes_fp} is neither in fna format nor in faa format, please check your input file")
+    unigene_faa_fp = Path(output_path) / "unigene.faa"
+    seqkit = ["conda", "run", "-n", "parallel-kofamscan.dependency.kofamscan", "seqkit"]
+    # An explicit FAA extension prevents nucleotide-alphabet-only proteins from
+    # being mistaken for DNA. Other FASTA inputs retain content-based detection.
+    input_name = str(unigenes_fp).lower().removesuffix(".gz")
+    if not input_name.endswith(".faa"):
+        check_fna = run(seqkit + ["seq", str(unigenes_fp), "-v", "-t", "dna", "-o", os.devnull],
+                        stdout=DEVNULL, stderr=DEVNULL)
+        if check_fna.returncode == 0:
+            print(f"Input {unigenes_fp} is FNA; translating with genetic code 11...")
+            run(seqkit + ["translate", "-T", "11", str(unigenes_fp), "-o", str(unigene_faa_fp)],
+                check=True)
+            return "FNA"
+    # seqkit writes uncompressed FASTA even when the original FAA is gzipped.
+    check_faa = run(seqkit + ["seq", str(unigenes_fp), "-v", "-t", "protein",
+                              "-o", str(unigene_faa_fp)], capture_output=True, text=True)
+    if check_faa.returncode != 0:
+        raise ValueError(f"Input {unigenes_fp} is neither valid FNA nor FAA: {check_faa.stderr}")
+    print(f"Input {unigenes_fp} is FAA; proceeding...")
+    return "FAA"
 
 
-def make_header_map_df(output_path):
-    sample_id = os.path.basename(output_path)
-    unigene_faa_fp = os.path.join(output_path, 'unigene.faa')
+def fasta_records(path):
+    """Yield the full defline (without '>') and canonical protein sequence."""
+    header = None
+    fragments = []
+    with Path(path).open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            line = line.rstrip("\r\n")
+            if line.startswith(">"):
+                if header is not None:
+                    if not fragments:
+                        raise ValueError(f"{path}: empty sequence for {header!r}")
+                    yield header, "".join(fragments).upper()
+                header, fragments = line[1:], []
+                if not header.strip():
+                    raise ValueError(f"{path}:{line_number}: empty FASTA header")
+            elif line.strip():
+                if header is None:
+                    raise ValueError(f"{path}:{line_number}: sequence before FASTA header")
+                fragments.append("".join(line.split()))
+    if header is not None:
+        if not fragments:
+            raise ValueError(f"{path}: empty sequence for {header!r}")
+        yield header, "".join(fragments).upper()
 
-    # use seqkit to tabulate unigenes
-    # col ids
-    # ID, sequence, MD5(sequence)
-    # headless input
 
-    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    # the sub-cmd fx2tab is bugged, sometimes it produce an enpty col before the md5 hash
-    # and the sub-cmd fx2tab seemed to be the only way for us to get the md5 hash of the sequence
-    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-    # screw it, just use uuid
-    # get the hased headers first
-    original_headers_fp = os.path.join(output_path, 'ori_headers.txt')
-    get_original_headers = run(
-        f"conda run -n parallel-kofamscan.dependency.kofamscan usearch -fastx_getlabels {unigene_faa_fp} -output {original_headers_fp}", shell=True)
-    if get_original_headers.returncode != 0:
-        sys.exit(
-            f"Error: Failed to get original headers from {unigene_faa_fp} using usearch")
-    # relab using uuid, format: >uuid
-    unigene_faa_uuid_fp = os.path.join(output_path, 'unigene_uuid.faa')
-    relabel_headers = run(
-        "conda run -n parallel-kofamscan.dependency.kofamscan seqkit replace -p .+ -r '{uuid}'" + f" {unigene_faa_fp} > {unigene_faa_uuid_fp}", shell=True)
-    if relabel_headers.returncode != 0:
-        sys.exit(
-            f"Error: Failed to relabel headers in {unigene_faa_fp}")
-    os.remove(unigene_faa_fp)
-    # get uuid headers
-    uuid_headers_fp = os.path.join(output_path, 'uuid_headers.txt')
-    get_uuid_headers = run(
-        f"conda run -n parallel-kofamscan.dependency.kofamscan usearch -fastx_getlabels {unigene_faa_uuid_fp} -output {uuid_headers_fp}", shell=True)
-    if get_uuid_headers.returncode != 0:
-        sys.exit(
-            f"Error: Failed to get uuid headers from {unigene_faa_uuid_fp} using usearch")
-    # perp header map df
-    with open(original_headers_fp, "rt") as f_ori, open(uuid_headers_fp, "rt") as f_uuid:
-        ori_headers = [line.strip() for line in f_ori]
-        uuid_headers = [line.strip() for line in f_uuid]
-    if len(ori_headers) != len(uuid_headers):
-        sys.exit(
-            f"Error: The number of original headers and uuid headers do not match, please check the input file and the relabeling step")
-    header_map_df = pd.DataFrame({"id": ori_headers, "uuid": uuid_headers})
-    # save the header map dataframe as a parquet file
-    header_map_parquet_out = os.path.join(output_path, 'header_map.parquet')
-    header_map_df.to_parquet(header_map_parquet_out, index=False)
-    os.remove(original_headers_fp)
-    os.remove(uuid_headers_fp)
+def make_header_map_df(output_path, input_type="FAA"):
+    """Stream the map; identical proteins share a hash across all samples."""
+    if input_type not in {"FAA", "FNA"}:
+        raise ValueError(f"Unknown input type: {input_type}")
+    output_path = Path(output_path)
+    schema = pa.schema([
+        ("sequence_header", pa.string()), ("sequence_hash", pa.string()),
+    ], metadata={b"hash_algorithm": b"sha256", b"input_type": input_type.encode("ascii")})
+    rows = []
+    with pq.ParquetWriter(output_path / "header_map.parquet", schema, compression="zstd") as writer:
+        with (output_path / "unigene_hash.faa").open("w", encoding="utf-8") as fasta:
+            for header, sequence in fasta_records(output_path / "unigene.faa"):
+                sequence_hash = hashlib.sha256(sequence.encode("ascii")).hexdigest()
+                fasta.write(f">{sequence_hash}\n{sequence}\n")
+                rows.append({"sequence_header": header, "sequence_hash": sequence_hash})
+                if len(rows) == BATCH_SIZE:
+                    writer.write_table(pa.Table.from_pylist(rows, schema=schema))
+                    rows = []
+            if rows:
+                writer.write_table(pa.Table.from_pylist(rows, schema=schema))
+    (output_path / "unigene.faa").unlink()
 
 
 def main():
     args = parse_args()
-
-    os.makedirs(args.output_path, exist_ok=True)
-
-    validate_input_and_convert_fna_to_faa(args.unigenes_fp, args.output_path)
-
-    make_header_map_df(args.output_path)
-
-    with open(os.path.join(args.output_path, "done"), "w") as f:
-        f.write("done")
+    Path(args.output_path).mkdir(parents=True, exist_ok=True)
+    input_type = validate_input_and_convert_fna_to_faa(args.unigenes_fp, args.output_path)
+    make_header_map_df(args.output_path, input_type)
+    (Path(args.output_path) / "done").write_text("done", encoding="utf-8")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

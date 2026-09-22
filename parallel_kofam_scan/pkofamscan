@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument('-f', '--force', default=False, type=bool,
                         help="whether to overwrite existing result, default is no")
     parser.add_argument('-e', '--min_e_value', default=0.001, type=float,
-                        help="Minimum E-value threshold to retain a KO hit during top-hit filtering, default is 0.001")
+                        help="Maximum E-value threshold to retain a KO hit during top-hit filtering, default is 0.001")
     parser.add_argument('-s', '--min_score', default=100, type=int,
                         help="Minimum hmmsearch score threshold to retain a KO hit during top-hit filtering, default is 100")
 

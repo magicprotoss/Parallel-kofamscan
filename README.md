@@ -67,9 +67,76 @@ options:
   -f FORCE, --force FORCE
                         whether to overwrite existing result, default is no
   -e MIN_E_VALUE, --min_e_value MIN_E_VALUE
-                        Minimum E-value threshold to retain a KO hit during top-hit filtering, default is
+                        Maximum E-value threshold to retain a KO hit during top-hit filtering, default is
                         0.001
   -s MIN_SCORE, --min_score MIN_SCORE
                         Minimum hmmsearch score threshold to retain a KO hit during top-hit filtering,
                         default is 100
 ```
+
+## Results
+
+Results are written under `<output_path>/KEGG_annotations/final_results/`:
+
+| File | Contents |
+| --- | --- |
+| `hmm-hits.parquet` | One row per reported HMM hit: `sequence_hash`, `KO`, `threshold`, `hmmsearch_score`, `E_value`, `KO_definition`, `if_score_higher_than_threshold`. All hits are retained, including those below the top-hit cutoffs. A hash can have multiple hits. Missing KO thresholds are null. |
+| `sequence-metadata-map.parquet` | One row per input sequence occurrence: `sample_id`, `sequence_header`, `sequence_hash`. Full headers (without `>`) and sequences without hits are preserved, including duplicate sequences within or across samples. |
+| `top-hits.xlsx` | One worksheet per sample, with `unigene_id` (the full sequence header) and `KO`. Samples with no qualifying hits have a header-only sheet. |
+
+`sequence_hash` is the lowercase hexadecimal SHA-256 of the protein sequence
+actually emitted for searching: sequence whitespace is removed and residues are
+uppercased. Terminal and internal `*` characters are preserved. FNA inputs are
+translated with genetic code 11 before hashing. Files ending in `.faa` or
+`.faa.gz` are treated as proteins; other FASTA inputs are classified by content.
+Identical canonical proteins receive the same hash and are searched once.
+
+Top-hit filtering uses `E_value <= --min_e_value` and
+`hmmsearch_score >= --min_score`. Among qualifying hits for a hash, the lowest
+E-value wins, followed by the highest score, then the lexically smallest KO for
+an exact tie. Every sequence occurrence with that hash receives the same KO.
+Duplicate full headers remain separate occurrences, even when their sequences
+differ. The Kofam `*` marker is retained in the hit table but is not an additional
+top-hit filter.
+
+Before exporting Excel, all sample names are checked against the 31-character
+worksheet limit, invalid characters, reserved names, and case-insensitive
+collisions. If any name fails, **all** sample sheets use `FAA1`, `FNA2`, etc.,
+with the prefix indicating the input type and a global sequence number assigned
+in sorted sample-ID order. A `sample-id-map` sheet records `sample_id` and
+`sheet_name` for every sample. Otherwise, the original sample IDs are retained.
+There are no literal brackets or slashes in the generated sheet names.
+
+The collector writes Parquet in batches of 8,192 rows. It keeps only the best
+qualifying hit per hash in a temporary on-disk SQLite index with an 8 MiB page
+cache, and uses batched lookups to stream sample sheets through openpyxl's
+write-only mode. It does not build a sample-by-hit table or load all workbook
+cells into memory. Temporary SQLite and staged output files are placed under
+the result directory; openpyxl worksheet XML uses the system temporary
+directory (respect `TMPDIR` when selecting storage on the VM). The `-t` collector
+option is retained for compatibility; collection uses one worker.
+
+### Migration
+
+The two Parquet files replace `annotations.parquet`. Readers should use
+`sequence_hash` to associate hits with sequence metadata, restricting to the
+samples/hashes needed rather than reconstructing a joined table for all samples.
+Old UUID-based working directories cannot be resumed with this version: rerun
+validation and annotation in a fresh output directory. The collector rejects
+legacy header-map schemas. The historical `test/merge_results.ipynb` uses the old
+intermediate format and is not a reader for the new results.
+
+The main environment no longer needs DuckDB; `lxml` is included for streaming
+Excel export. Update the environment from `parallel_kofam_scan/envs/main.yaml`
+on the VM before validation.
+
+## Testing
+
+Regression tests and the VM validation procedure are in
+[`test/test_collect_results.py`](test/test_collect_results.py) and
+[`test/VM_VALIDATION.md`](test/VM_VALIDATION.md). Tests have **not been run locally**.
+The VM regression suite, real SeqKit preprocessing check, stock workflow, and
+1,402-file dataset passed their checks. Full collection processed 54,147,991
+hits in 633.80 seconds with 258.39 MiB sampled peak RSS. See
+[`test/VM_TEST_STATUS.md`](test/VM_TEST_STATUS.md) for results, audit coverage,
+measurement limitations, and output locations (verified 2026-09-22).

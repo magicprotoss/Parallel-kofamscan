@@ -14,4 +14,4 @@ dependencies:
   - tqdm
   - snakemake>=9.16.0
   - openpyxl
-  - python-duckdb
+  - lxml
